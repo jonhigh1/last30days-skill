@@ -531,6 +531,9 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_PERPLEXITY_REASONING_EFFORT', None),
         ('LAST30DAYS_PERPLEXITY_DEEP_TIMEOUT_SECONDS', '600'),
         ('PARALLEL_API_KEY', None),
+        # Keenable is keyless by default; this optional key only lifts the rate
+        # limit (never required to use the keenable web backend).
+        ('KEENABLE_API_KEY', None),
         ('XQUIK_API_KEY', None),
         # Host-native search signal: set by the SKILL.md agent-host path when the
         # invoking runtime has its own (better) web-search tool, so the engine's

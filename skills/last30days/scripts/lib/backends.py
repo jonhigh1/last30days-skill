@@ -29,7 +29,7 @@ say the next run will try" — rendered as "will use". It is not an
 observation of what served a past run, and runtime failover can still
 diverge mid-run (a present-but-expired paid key passes a presence probe).
 
-Paid lanes (xai, xquik, serper, serpapi, and every other API-key backend, including
+Paid lanes (xai, xquik, serper, and every other API-key backend, including
 ScrapeCreators) probe KEY PRESENCE ONLY: a dict lookup, never a network
 call or credential spend. Binary-backed lanes reuse the U1 dependency
 probe layer (``health.probe_dependency``) so a stale shim reads as BROKEN,
@@ -58,10 +58,10 @@ TIER_WARN = "warn"
 TIER_ERROR = "error"
 
 # Web search backend order. grounding.web_search's auto branch owns the
-# runtime behavior (brave -> exa -> serper -> serpapi -> parallel -> keyless floor);
+# runtime behavior (brave -> exa -> serper -> parallel -> keyless floor);
 # there is no importable constant there, so this declaration is guarded by
 # the grounding-auto parity test rather than an import.
-WEB_BACKEND_ORDER: Tuple[str, ...] = ("brave", "exa", "serper", "serpapi", "parallel", "keyless")
+WEB_BACKEND_ORDER: Tuple[str, ...] = ("brave", "exa", "serper", "parallel", "keenable", "keyless")
 
 # YouTube backend order (pipeline: yt-dlp first, ScrapeCreators search
 # fallback when yt-dlp is absent or fails — see lib/pipeline.py).
@@ -331,6 +331,33 @@ def _probe_web_keyless(config: Dict[str, Any]) -> BackendFinding:
     )
 
 
+def _probe_keenable(config: Dict[str, Any]) -> BackendFinding:
+    """Keenable: a real keyless web-search API (above the DDG/SearXNG floor).
+
+    Works with no key against the public endpoint; an optional KEENABLE_API_KEY
+    only lifts the rate limit. Like the keyless floor, it is engine-side web
+    search and is suppressed on hosts that have native search.
+    """
+    requires = "no key (optional KEENABLE_API_KEY lifts rate limit); suppressed on native-search hosts"
+    if env.keyless_web_allowed(config):
+        keyed = " (KEENABLE_API_KEY present; rate limit lifted)" if config.get("KEENABLE_API_KEY") else ""
+        return BackendFinding(
+            name="keenable",
+            status=health.OK,
+            detail=f"keenable keyless{keyed or ' (no key; full-quality search API)'}",
+            requires=requires,
+        )
+    # Keyless-tier: suppressed on native-search hosts even when a key is set
+    # (the key only lifts the rate limit, it does not promote to the paid tier).
+    return BackendFinding(
+        name="keenable",
+        status=health.MISSING,
+        detail="keenable suppressed: host has native web search",
+        prescription="",
+        requires=requires,
+    )
+
+
 def _probe_reddit_public(config: Dict[str, Any]) -> BackendFinding:
     """Public keyless Reddit composite; internal lanes are sub-probe detail."""
     return BackendFinding(
@@ -357,11 +384,11 @@ _WEB_PROBES: Dict[str, Callable[[Dict[str, Any]], BackendFinding]] = {
     "brave": _key_probe("brave", "BRAVE_API_KEY", "BRAVE_API_KEY"),
     "exa": _key_probe("exa", "EXA_API_KEY", "EXA_API_KEY"),
     "serper": _key_probe("serper", "SERPER_API_KEY", "SERPER_API_KEY"),
-    "serpapi": _key_probe("serpapi", "SERPAPI_API_KEY", "SERPAPI_API_KEY"),
     "parallel": _key_probe("parallel", "PARALLEL_API_KEY", "PARALLEL_API_KEY"),
+    "keenable": _probe_keenable,
     "keyless": _probe_web_keyless,
 }
-_WEB_KEYED = {"brave", "exa", "serper", "serpapi", "parallel"}
+_WEB_KEYED = {"brave", "exa", "serper", "parallel"}
 
 _SC_SPEC = BackendSpec(
     name="scrapecreators",
@@ -413,10 +440,8 @@ DESCRIPTORS: Dict[str, ChainDescriptor] = {
         backends=tuple(
             BackendSpec(
                 name=name,
-                requires=(
-                    f"{name.upper()}_API_KEY" if name in _WEB_KEYED
-                    else "no key; suppressed on native-search hosts"
-                ),
+                requires=(f"{name.upper()}_API_KEY" if name in _WEB_KEYED
+                          else "no key; suppressed on native-search hosts"),
                 probe=_WEB_PROBES[name],
                 paid=name in _WEB_KEYED,
             )

@@ -1,12 +1,11 @@
-"""Web search retrieval via Brave Search, Exa, Serper, SerpApi, Parallel, or a keyless floor."""
+"""Web search retrieval via Brave Search, Exa, Serper, Parallel, Keenable, or a keyless floor."""
 
 from __future__ import annotations
 
-import re
 import sys
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from urllib.parse import urlparse
 
 from . import dates, env, http, schema, web_search_keyless
@@ -164,48 +163,6 @@ def serper_search(
 
 
 # ---------------------------------------------------------------------------
-# SerpApi Google Search
-# ---------------------------------------------------------------------------
-
-def serpapi_search(
-    query: str, date_range: tuple[str, str], api_key: str, count: int = 5,
-) -> tuple[list[dict], dict]:
-    data = http.request(
-        "GET",
-        "https://serpapi.com/search.json",
-        params={
-            "engine": "google",
-            "q": query,
-            "api_key": api_key,
-            "num": count,
-            "tbs": f"cdr:1,cd_min:{_serpapi_date_param(date_range[0])},cd_max:{_serpapi_date_param(date_range[1])}",
-        },
-        timeout=15,
-    )
-    items = []
-    for i, r in enumerate((data.get("organic_results", []))[:count]):
-        if not isinstance(r, dict):
-            continue
-        link = r.get("link", "")
-        raw_date = r.get("date") or ""
-        pub_date = _parse_serpapi_date(raw_date)
-        if not _in_date_range(pub_date, date_range):
-            continue
-        items.append({
-            "id": f"WG{i + 1}",
-            "title": r.get("title", ""),
-            "url": link,
-            "source_domain": _domain(link),
-            "snippet": r.get("snippet", ""),
-            "date": pub_date,
-            "relevance": 0.8,
-            "why_relevant": "SerpApi Google Search",
-        })
-    artifact = {"label": "serpapi", "webSearchQueries": [query], "resultCount": len(items)}
-    return items, artifact
-
-
-# ---------------------------------------------------------------------------
 # Parallel AI Search
 # ---------------------------------------------------------------------------
 
@@ -246,6 +203,57 @@ def parallel_search(
     return items, artifact
 
 
+# ---------------------------------------------------------------------------
+# Keenable Search (keyless-by-default; optional key lifts the rate limit)
+# ---------------------------------------------------------------------------
+
+def keenable_search(
+    query: str, date_range: tuple[str, str], api_key: str | None = None, count: int = 5,
+) -> tuple[list[dict], dict]:
+    """Keenable web search. Keyless against the public endpoint by default; an
+    optional KEENABLE_API_KEY only lifts the rate limit (never required)."""
+    headers = {"Content-Type": "application/json", "X-Keenable-Title": "last30days"}
+    if api_key:
+        url = "https://api.keenable.ai/v1/search"
+        headers["X-API-Key"] = api_key
+    else:
+        url = "https://api.keenable.ai/v1/search/public"
+    data = http.request(
+        "POST", url,
+        headers=headers,
+        json_data={
+            "query": query,
+            "mode": "pro",
+            "published_after": date_range[0],
+            "published_before": date_range[1],
+        },
+        timeout=15,
+    )
+    items = []
+    for i, r in enumerate((data.get("results", []))[:count]):
+        if not isinstance(r, dict):
+            continue
+        url_r = r.get("url", "")
+        if not url_r:
+            continue
+        raw_date = r.get("published_at") or ""
+        pub_date = _normalize_date(raw_date.split("T")[0] if "T" in raw_date else raw_date[:10]) if raw_date else None
+        if not _in_date_range(pub_date, date_range):
+            continue
+        items.append({
+            "id": f"WK{i + 1}",
+            "title": r.get("title", ""),
+            "url": url_r,
+            "source_domain": _domain(url_r),
+            "snippet": (r.get("description") or "")[:500],
+            "date": pub_date,
+            "relevance": 0.8,
+            "why_relevant": "Keenable web search",
+        })
+    artifact = {"label": "keenable", "webSearchQueries": [query], "resultCount": len(items)}
+    return items, artifact
+
+
 def _parse_serper_date(raw: str) -> str | None:
     if not raw:
         return None
@@ -260,31 +268,6 @@ def _parse_serper_date(raw: str) -> str | None:
     return None
 
 
-def _parse_serpapi_date(raw: str) -> str | None:
-    parsed = _parse_serper_date(raw)
-    if parsed:
-        return parsed
-    text = raw.strip()
-    lower = text.lower()
-    today = datetime.now(timezone.utc).date()
-    if lower == "today":
-        return today.isoformat()
-    if lower == "yesterday":
-        return (today - timedelta(days=1)).isoformat()
-    match = re.match(r"^(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago$", lower)
-    if match:
-        value = int(match.group(1))
-        unit = match.group(2)
-        days_by_unit = {
-            "minute": 0,
-            "hour": 0,
-            "day": value,
-            "week": value * 7,
-            "month": value * 30,
-            "year": value * 365,
-        }
-        return (today - timedelta(days=days_by_unit[unit])).isoformat()
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -305,15 +288,17 @@ def web_search(
             backend = "exa"
         elif config.get("SERPER_API_KEY"):
             backend = "serper"
-        elif config.get("SERPAPI_API_KEY"):
-            backend = "serpapi"
         elif config.get("PARALLEL_API_KEY"):
             backend = "parallel"
         elif env.keyless_web_allowed(config):
-            # No paid key and the host has no native search -> use the keyless
-            # floor. On a native-search host this branch is skipped (the model
-            # supplies web results itself), so the engine returns nothing here.
-            backend = "keyless"
+            # No paid key and the host has no native search. Keenable is a real
+            # keyless search API (better than the DDG/SearXNG floor), so it is
+            # the preferred keyless default; the floor stays reachable via
+            # --web-backend keyless. Keenable is keyless-tier: an optional
+            # KEENABLE_API_KEY only lifts the rate limit, it does not promote
+            # keenable to the paid tier, so this stays behind the native-search
+            # suppression guard (on a native-search host the model searches).
+            backend = "keenable"
         else:
             return [], {}
     items: list[dict] = []
@@ -333,16 +318,14 @@ def web_search(
         if not key:
             raise RuntimeError("SERPER_API_KEY is required when web_backend='serper'")
         items, artifact = serper_search(query, date_range, key)
-    elif backend == "serpapi":
-        key = config.get("SERPAPI_API_KEY")
-        if not key:
-            raise RuntimeError("SERPAPI_API_KEY is required when web_backend='serpapi'")
-        items, artifact = serpapi_search(query, date_range, key)
     elif backend == "parallel":
         key = config.get("PARALLEL_API_KEY")
         if not key:
             raise RuntimeError("PARALLEL_API_KEY is required when web_backend='parallel'")
         items, artifact = parallel_search(query, date_range, key)
+    elif backend == "keenable":
+        # Keyless by default; the optional key only lifts the rate limit.
+        items, artifact = keenable_search(query, date_range, config.get("KEENABLE_API_KEY"))
     elif backend == "keyless":
         items, artifact = web_search_keyless.keyless_search(query, date_range, config)
     elif backend != "none":
@@ -430,12 +413,6 @@ def _normalize_date(value: object) -> str | None:
 
 def _serper_date_param(iso_date: str) -> str:
     """Convert YYYY-MM-DD to MM/DD/YYYY for Serper tbs parameter."""
-    parts = iso_date.split("-")
-    return f"{parts[1]}/{parts[2]}/{parts[0]}"
-
-
-def _serpapi_date_param(iso_date: str) -> str:
-    """Convert YYYY-MM-DD to MM/DD/YYYY for SerpApi tbs parameter."""
     parts = iso_date.split("-")
     return f"{parts[1]}/{parts[2]}/{parts[0]}"
 
